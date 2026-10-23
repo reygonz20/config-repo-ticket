@@ -1,0 +1,108 @@
+name: tickets
+
+x-java-healthcheck: &java-healthcheck
+  interval: 30s
+  timeout: 5s
+  retries: 10
+  start_period: 90s
+  start_interval: 5s
+
+x-ms-env: &ms-env
+  SPRING_CONFIG_IMPORT: optional:configserver:http://config-server:8888
+  EUREKA_URL: http://eureka-server:8761/eureka/
+  DB_URL: jdbc:mysql://mysql:3306/db_tickets?useSSL=false&serverTimezone=America/Lima&allowPublicKeyRetrieval=true
+  DB_USER: ${DB_USER}
+  DB_PASSWORD: ${DB_PASSWORD}
+  JWT_SECRET: ${JWT_SECRET}
+
+x-ms-depends: &ms-depends
+  mysql:
+    condition: service_healthy
+  config-server:
+    condition: service_healthy
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: db_tickets
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: America/Lima
+      LANG: C.UTF-8                  # el cliente mysql del init lee el script como UTF-8 (si no, usa latin1 y rompe las tildes)
+    ports: ["3307:3306"]            # 3307 para no chocar con el MySQL local
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./SCRIPT_FINAL_ENTREGA.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:                     # por TCP: solo responde cuando terminó el init
+      <<: *java-healthcheck
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      start_period: 60s
+
+  eureka-server:
+    build: ../tickets-eureka-server
+    ports: ["8761:8761"]
+    mem_limit: 512m
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:8761/eureka/apps"]
+
+  config-server:
+    build: ../tickets-config-server
+    command: ["--eureka.client.service-url.defaultZone=http://eureka-server:8761/eureka/"]
+    environment:
+      SPRING_CLOUD_CONFIG_SERVER_GIT_REFRESHRATE: 60   # no hace fetch a GitHub en cada healthcheck
+    ports: ["8888:8888"]
+    mem_limit: 512m
+    depends_on:
+      eureka-server: { condition: service_healthy }
+    healthcheck:
+      <<: *java-healthcheck
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:8888/application/default"]
+
+  auth-service:
+    build: ../tickets-auth-service
+    environment: *ms-env
+    ports: ["8081:8081"]
+    mem_limit: 512m
+    restart: on-failure
+    depends_on: *ms-depends
+
+  tecnico-service:
+    build: ../tickets-tecnico-service
+    environment: *ms-env
+    ports: ["8082:8082"]
+    mem_limit: 512m
+    restart: on-failure
+    depends_on: *ms-depends
+
+  ticket-service:
+    build: ../tickets-ticket-service
+    environment: *ms-env
+    ports: ["8083:8083"]
+    mem_limit: 512m
+    restart: on-failure
+    depends_on: *ms-depends
+
+  api-gateway:
+    build: ../tickets-api-gateway
+    environment:
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      EUREKA_CLIENT_REGISTRYFETCHINTERVALSECONDS: 5    # detecta los servicios más rápido
+    ports: ["8080:8080"]
+    mem_limit: 512m
+    restart: on-failure
+    depends_on:
+      eureka-server:   { condition: service_healthy }
+      auth-service:    { condition: service_started }
+      tecnico-service: { condition: service_started }
+      ticket-service:  { condition: service_started }
+
+  frontend:
+    build: ../tickets-frontend
+    ports: ["4200:80"]
+    depends_on: [api-gateway]
+
+volumes:
+  mysql_data:
